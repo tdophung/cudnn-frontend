@@ -61,6 +61,11 @@ cutedsl = [
     "apache-tvm-ffi",
     "torch-c-dlpack-ext",
 ]
+cutedsl-compile = [
+    "nvidia-cutlass-dsl[cu13]>=4.5.0",
+    "cuda-python",
+    "apache-tvm-ffi>=0.1.12",
+]
 
 [dependency-groups]
 dev = [

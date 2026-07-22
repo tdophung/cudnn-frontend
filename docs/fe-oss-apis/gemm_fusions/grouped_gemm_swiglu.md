@@ -96,6 +96,47 @@ $$
 
 ## API Usage
 
+### Framework-neutral compile-only API
+
+The compile-only entrypoint is intended for frameworks that own their output
+allocation and launch through TVM-FFI. It consumes tensor metadata, compiles a
+native `tvm_ffi.Function`, and returns a `GroupedGemmAbiDescriptor` describing
+the exact positional ABI of that function. It does not allocate framework
+buffers and does not launch the kernel.
+
+Install the compiler path without PyTorch:
+
+```bash
+pip install -e ".[cutedsl-compile]"
+```
+
+```python
+from cudnn import (
+    GroupedGemmElementType as DType,
+    GroupedGemmOperandDesc as Operand,
+    GroupedGemmSwigluConfig,
+    compile_grouped_gemm_swiglu,
+)
+
+operands = {
+    "a": Operand("a", DType.FLOAT8_E4M3FN, (256, 128, 1), (1, 0, 2)),
+    "b": Operand("b", DType.FLOAT8_E4M3FN, (256, 128, 1), (1, 0, 2)),
+    # sfa, sfb, padded_offsets, alpha, prob, norm_const and the five
+    # output descriptors are omitted here for brevity.
+}
+native_function, abi = compile_grouped_gemm_swiglu(
+    operands=operands,
+    config=GroupedGemmSwigluConfig(),
+)
+```
+
+The supported native ABI groups the eight input buffers, the five output
+buffers, and the CUDA stream. This grouping can be registered directly with
+`jax-tvm-ffi` as `abi.arg_spec == ("args", "rets", "ctx.stream")`. A native
+CuTeDSL reorder launcher hides the volatile raw-kernel operand order, so no
+Python callback runs during execution. The `amax` slot is disabled in this
+five-output prototype.
+
 ### High-level Wrapper
 
 ```python

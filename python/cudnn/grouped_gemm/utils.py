@@ -33,7 +33,7 @@ This module contains the tile scheduler classes and helper functions used by bot
 the forward (grouped_gemm_swiglu) and backward (grouped_gemm_dswiglu) kernels.
 """
 
-from typing import Tuple, Union
+from typing import TYPE_CHECKING, Tuple, Union
 
 from cutlass.cutlass_dsl import (
     Boolean,
@@ -52,7 +52,6 @@ from cutlass.cutlass_dsl import T
 from cutlass.cute.typing import Float32, Int32
 import cutlass.cute as cute
 import cutlass
-import torch
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import (
     Agent,
@@ -60,6 +59,9 @@ from cutlass.pipeline import (
     PipelineUserType,
     make_pipeline_state,
 )
+
+if TYPE_CHECKING:
+    import torch
 
 ##############################################################################
 # Helper functions
@@ -201,8 +203,10 @@ def fmax(a: Union[float, Float32], b: Union[float, Float32], *, loc=None, ip=Non
     )
 
 
-def logical_shape_fp4x2_aware(tensor: torch.Tensor) -> Tuple[int, ...]:
+def logical_shape_fp4x2_aware(tensor: "torch.Tensor") -> Tuple[int, ...]:
     """Return correct shapes for NVFP4 tensor."""
+    import torch
+
     if tensor.dtype == torch.float4_e2m1fn_x2:
         innermost_dim_index = next((i for i, s in enumerate(tensor.stride()) if s == 1), None)
         if innermost_dim_index is None:
