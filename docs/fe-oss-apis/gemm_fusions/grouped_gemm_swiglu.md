@@ -137,6 +137,23 @@ CuTeDSL reorder launcher hides the volatile raw-kernel operand order, so no
 Python callback runs during execution. The `amax` slot is disabled in this
 five-output prototype.
 
+The paired backward entrypoint follows the same framework-neutral contract:
+
+```python
+from cudnn import GroupedGemmDswigluConfig, compile_grouped_gemm_dswiglu
+
+native_backward, backward_abi = compile_grouped_gemm_dswiglu(
+    operands=backward_operands,
+    config=GroupedGemmDswigluConfig(),
+)
+```
+
+It groups ten inputs (`a`, `b`, the saved forward projection `c`, scale
+factors, grouped offsets, alpha/beta, probability, and normalization), five
+outputs (`d`, `d_col`, both output scale factors, and `dprob`), and the CUDA
+stream. Importing either compile-only entrypoint does not import the
+Torch-oriented `api.py` modules.
+
 ### High-level Wrapper
 
 ```python

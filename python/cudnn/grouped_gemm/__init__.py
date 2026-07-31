@@ -21,6 +21,8 @@ _LAZY_IMPORTS = {
     "compile_grouped_gemm_swiglu": (".grouped_gemm_swiglu", "compile_grouped_gemm_swiglu"),
     "GroupedGemmDswigluSm100": (".grouped_gemm_dswiglu.api", "GroupedGemmDswigluSm100"),
     "grouped_gemm_dswiglu_wrapper_sm100": (".grouped_gemm_dswiglu.api", "grouped_gemm_dswiglu_wrapper_sm100"),
+    "GroupedGemmDswigluConfig": (".grouped_gemm_dswiglu", "GroupedGemmDswigluConfig"),
+    "compile_grouped_gemm_dswiglu": (".grouped_gemm_dswiglu", "compile_grouped_gemm_dswiglu"),
     "GroupedGemmQuantSm100": (".grouped_gemm_quant.api", "GroupedGemmQuantSm100"),
     "grouped_gemm_quant_wrapper_sm100": (".grouped_gemm_quant.api", "grouped_gemm_quant_wrapper_sm100"),
     "GroupedGemmSreluSm100": (".grouped_gemm_srelu.api", "GroupedGemmSreluSm100"),
