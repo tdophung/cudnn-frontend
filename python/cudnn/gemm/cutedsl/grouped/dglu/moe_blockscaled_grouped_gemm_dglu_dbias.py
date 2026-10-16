@@ -14,6 +14,7 @@ This module contains only the kernel class.
 MoE scheduler components live in moe_persistent_scheduler.py / moe_sched_extension.py / moe_utils.py.
 """
 
+import os
 from typing import Type, Tuple, Union, Optional
 from functools import partial
 
@@ -34,6 +35,27 @@ from cutlass.cute.typing import Float32, Int32, AddressSpace
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import math, llvm
 from cutlass._mlir.dialects import vector, arith
+
+# dSwiGLU sigmoid lookup table (scalar epilogue, beta == 1).
+#
+# The scalar dSwiGLU epilogue computes s = rcp_approx(1 + exp(-x, fastmath)) for a gate x that is
+# a BF16 value (C) times beta. With beta == 1, s depends only on the 16 bits of the BF16 gate, so
+# it can be read from a table instead of computed with two MUFU operations. Each CTA fills the
+# table once, in shared memory, by evaluating that same expression, so the table holds exactly
+# what the epilogue would compute, and the output is bit-identical.
+#
+# Measured on SM100 for all 65,536 BF16 inputs: s == 0.5 for every |x| below magnitude 0x33b2,
+# s == 1 for x >= 0x4186 (16.75) and s == 0 for x <= -0x42af (-87.5), +-inf included; NaN gives
+# the formula's own NaN. The table covers magnitudes [_SIG_LO, _SIG_HI] per sign: entry _SIG_LO
+# (0.5) and entry _SIG_HI (the saturated value of each sign) absorb everything outside, so the
+# lookup clamps the magnitude; one more slot holds the formula's NaN.
+_SIG_LO = 0x33B1
+_SIG_HI = 0x42AF
+_SIG_STRIDE = 3840  # >= _SIG_HI - _SIG_LO + 1 entries per sign
+_SIG_NAN_SLOT = 2 * _SIG_STRIDE
+_SIG_FILL_VEC = 8  # values per thread per fill step, one TensorSSA vector as in the epilogue
+_SIG_TABLE_ENTRIES = 2 * _SIG_STRIDE + _SIG_FILL_VEC  # NaN slot plus padding to whole vectors
+_SIG_TABLE_BYTES = _SIG_TABLE_ENTRIES * 4
 
 from ..moe_persistent_scheduler import (
     MoEPersistentTileScheduler,
@@ -372,6 +394,12 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
 
         self.vectorized_f32 = vectorized_f32
         self.use_dynamic_sched = use_dynamic_sched
+        # Read the dSwiGLU sigmoid from a shared-memory table (scalar epilogue only).
+        self.sigmoid_table = (
+            act_func == "dswiglu"
+            and not vectorized_f32
+            and os.environ.get("CUDNN_FE_DSWIGLU_SIGMOID_TABLE", "1") == "1"
+        )
 
         # Amax reduction configuration
         self.num_epilog_warps = len(self.epilog_warp_id)
@@ -516,6 +544,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             self.occupancy,
             self.store_d_directly,
             self.generate_dbias,
+            _SIG_TABLE_BYTES if self.sigmoid_table else 0,
         )
 
         # Compute A/B/D/Scale shared memory layout
@@ -1053,6 +1082,14 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                     128 * self.epi_tile[1] * 2 if self.generate_dbias else 1,
                 ],
                 128 if self.generate_dbias else 4,
+            ]
+            # dSwiGLU sigmoid table (see _SIG_LO)
+            sSigTable: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32,
+                    _SIG_TABLE_ENTRIES if self.sigmoid_table else 1,
+                ],
+                16,
             ]
 
         self.shared_storage = SharedStorage
@@ -1711,6 +1748,42 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                 gmem_ptr = dbias_gmem_2d[(expert_idx, n_offset, None)].iterator.llvm_ptr
                 atomic_add_bf16x2(gmem_ptr, sum_a, sum_b)
 
+    def sigmoid_by_formula(self, ab1_vec_load, res: cute.Tensor):
+        """s = rcp_approx(1 + exp(-x, fastmath)), element by element, into res."""
+        sig_rcp = (1 + cute.math.exp(-1 * ab1_vec_load, True)).to(self.acc_dtype)
+        res.store(sig_rcp)
+        # let every res[?] be cute.arch.rcp_approx(res[?])
+        [res.__setitem__(i, cute.arch.rcp_approx(res[i])) for i in range(cute.size(res.shape))]
+
+    @cute.jit
+    def sigmoid_table_index(self, bits: cutlass.Int32) -> cutlass.Int32:
+        """Table slot for a BF16 gate's bits: the magnitude clamped to [_SIG_LO, _SIG_HI], offset by
+        the sign's stride, or the NaN slot."""
+        magnitude = bits & cutlass.Int32(0x7FFF)
+        clamped = cutlass.min(cutlass.max(magnitude, cutlass.Int32(_SIG_LO)), cutlass.Int32(_SIG_HI))
+        index = clamped - cutlass.Int32(_SIG_LO) + (bits >> 15) * cutlass.Int32(_SIG_STRIDE)
+        return cutlass.select_(magnitude > cutlass.Int32(0x7F80), cutlass.Int32(_SIG_NAN_SLOT), index)
+
+    @cute.jit
+    def fill_sigmoid_table(self, sig_table: cute.Tensor, tidx: cutlass.Int32):
+        """Fill the sigmoid table with the epilogue's own expression; every thread of the CTA
+        takes a share. Slot e holds the gate with magnitude _SIG_LO + e % _SIG_STRIDE and the sign
+        e // _SIG_STRIDE; the NaN slot holds the result for a NaN gate."""
+        for base in cutlass.range(tidx * _SIG_FILL_VEC, _SIG_TABLE_ENTRIES, self.threads_per_cta * _SIG_FILL_VEC):
+            bits = cute.make_rmem_tensor((_SIG_FILL_VEC,), cutlass.Uint16)
+            for j in cutlass.range_constexpr(_SIG_FILL_VEC):
+                e = base + j
+                sign = cutlass.Int32(e >= _SIG_STRIDE)
+                magnitude = cutlass.Int32(_SIG_LO) + e - sign * cutlass.Int32(_SIG_STRIDE)
+                b = (sign << 15) | magnitude
+                b = cutlass.select_(e >= cutlass.Int32(_SIG_NAN_SLOT), cutlass.Int32(0x7FC0), b)
+                bits[j] = cutlass.Uint16(b)
+            x = cute.recast_tensor(bits, cutlass.BFloat16).load() * cutlass.Float32(1.0)
+            res = cute.make_rmem_tensor((_SIG_FILL_VEC,), cutlass.Float32)
+            self.sigmoid_by_formula(x, res)
+            for j in cutlass.range_constexpr(_SIG_FILL_VEC):
+                sig_table[base + j] = res[j]
+
     @cute.jit
     def dswiglu(
         self,
@@ -1721,6 +1794,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         beta_val: Float32,
         square_alpha: Float32,
         dprob_swiglu: Optional[cute.Tensor] = None,
+        sig_table: Optional[cute.Tensor] = None,
     ):
         LOG2_E = cutlass.Float32(1.4426950408889634)
         if cutlass.const_expr(self.vectorized_f32):
@@ -1865,6 +1939,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                 dprob_swiglu = dprob_swiglu.load()
             return d1_vec, d2_vec, dprob_swiglu
         else:
+            # The gate's BF16 bits, for the sigmoid table.
+            ab1_bits = cute.recast_tensor(ab1_vec_load, cutlass.Uint16) if cutlass.const_expr(sig_table is not None) else None
             acc_vec = acc_vec.load()
             ab1_vec_load = ab1_vec_load.load()
             ab2_vec_load = ab2_vec_load.load()
@@ -1873,11 +1949,16 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
             ab1_vec_load = ab1_vec_load * beta_val  # apply scale for C
             ab2_vec_load = ab2_vec_load * beta_val  # apply scale for C
 
-            sig_rcp = (1 + cute.math.exp(-1 * ab1_vec_load, True)).to(self.acc_dtype)
-            res = cute.make_rmem_tensor(sig_rcp.shape, cutlass.Float32)
-            res.store(sig_rcp)
-            # let every res[?] be cute.arch.rcp_approx(res[?])
-            [res.__setitem__(i, cute.arch.rcp_approx(res[i])) for i in range(cute.size(res.shape))]
+            res = cute.make_rmem_tensor(ab1_vec_load.shape, cutlass.Float32)
+            if cutlass.const_expr(sig_table is not None):
+                if beta_val == cutlass.Float32(1.0):
+                    # The gate is the BF16 value itself: read s from the table.
+                    for i in cutlass.range_constexpr(cute.size(res.shape)):
+                        res[i] = sig_table[self.sigmoid_table_index(cutlass.Int32(ab1_bits[i]))]
+                else:
+                    self.sigmoid_by_formula(ab1_vec_load, res)
+            else:
+                self.sigmoid_by_formula(ab1_vec_load, res)
             sig = res.load()
             swish = ab1_vec_load * sig
 
@@ -2285,6 +2366,12 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sched_storage = storage.scheduler
+
+        sSigTable = None
+        if cutlass.const_expr(self.sigmoid_table):
+            sSigTable = storage.sSigTable.get_tensor(cute.make_layout((_SIG_TABLE_ENTRIES,)))
+            self.fill_sigmoid_table(sSigTable, tidx)
+            cute.arch.sync_threads()
 
         # Initialize mainloop ab_pipeline (barrier) and states
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
@@ -3186,7 +3273,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
                     #
                     square_alpha = alpha_val * alpha_val
                     if cutlass.const_expr(self.act_func == "dswiglu"):
-                        d1_vec, d2_vec, dprob_swiglu = self.dswiglu(acc_vec, ab1_vec_load, ab2_vec_load, mProb, beta_val, square_alpha, dprob_swiglu)
+                        d1_vec, d2_vec, dprob_swiglu = self.dswiglu(
+                            acc_vec, ab1_vec_load, ab2_vec_load, mProb, beta_val, square_alpha, dprob_swiglu, sSigTable
+                        )
                     elif cutlass.const_expr(self.act_func == "dgeglu"):
                         d1_vec, d2_vec, dprob_swiglu = self.dgeglu(
                             acc_vec,
@@ -3792,6 +3881,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         occupancy: int,
         store_d_directly: bool,
         generate_dbias: bool = False,
+        extra_epi_bytes: int = 0,
     ) -> Tuple[int, int, int]:
         """Computes the number of stages for A/B/D operands based on heuristics.
 
@@ -3896,7 +3986,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel:
         # dBias transpose buffer: (128, 64) column-major FP32 = 32 KB
         dbias_bytes = 128 * 64 * cute.size_in_bytes(cutlass.Float32, cute.make_layout((1,))) if generate_dbias else 0
         # Epilogue bytes
-        epi_bytes = c_bytes + d_bytes + amax_bytes + dbias_bytes
+        epi_bytes = c_bytes + d_bytes + amax_bytes + dbias_bytes + extra_epi_bytes
 
         # Calculate A/B stages:
         # Start with total smem per CTA (capacity / occupancy)
